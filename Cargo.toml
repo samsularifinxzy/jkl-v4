@@ -1,0 +1,30 @@
+[package]
+name = "cargo-test-runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Crypto & Math (The Engine)
+secp256k1 = { version = "0.27", features = ["rand", "global-context"] }
+sha2 = "0.10"
+ripemd = "0.1"
+bs58 = "0.5"
+rand = "0.8"
+
+# Concurrency (The Turbo)
+rayon = "1.7"
+
+# Utilities
+hex = "0.4"
+dotenv = "0.15"
+
+# Network & IO (The Loader)
+reqwest = { version = "0.11", features = ["blocking", "rustls-tls"] }
+flate2 = "1.0"
+indicatif = "0.17" # Progress bar
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = 'abort'
